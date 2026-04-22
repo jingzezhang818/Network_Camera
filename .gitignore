@@ -5,7 +5,7 @@ Makefile.*
 *.obj
 *.a
 *.so
-*.dll
+# *.dll
 *.exe
 *.pro.user
 *.stash

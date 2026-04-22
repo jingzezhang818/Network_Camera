@@ -9,8 +9,8 @@
 
 // VideoPacketBatcher 职责：
 // 1) 将原始视频字节流按协议封成固定 1024B 包；
-// 2) 按 1MiB（1024 个包）聚合输出待发送批次；
-// 3) 缓存未满 1MiB 的尾部，等待后续输入补齐。
+// 2) 按可配置批次聚合输出待发送批次（默认 1MiB=1024 个包）；
+// 3) 缓存未满一个批次的尾部，等待后续输入补齐。
 class VideoPacketBatcher
 {
 public:
@@ -47,17 +47,27 @@ public:
     explicit VideoPacketBatcher(const RouteFields &routeFields = defaultRouteFields());
 
     // ===== 运行时处理 =====
-    // 原始视频字节流 -> 协议包流 -> 1MiB 批次输出。
-    // outBatches 只返回本次刚凑满的批次；不足 1MiB 的尾部保留在内部缓存。
+    // 设置聚合批次大小（单位：字节）。
+    // 要求：
+    // 1) batchBytes >= 1024；
+    // 2) batchBytes 为 1024 的整数倍，确保不打断协议包边界。
+    // 返回 true 表示设置成功。
+    bool setBatchBytes(int batchBytes);
+
+    // 查询当前聚合批次大小（单位：字节）。
+    int batchBytes() const;
+
+    // 原始视频字节流 -> 协议包流 -> 固定批次输出（批次大小可配置）。
+    // outBatches 只返回本次刚凑满的批次；不足一个批次的尾部保留在内部缓存。
     EnqueueResult enqueueVideoPayload(const QByteArray &videoPayload,
                                       QVector<QByteArray> &outBatches);
 
-    // 查询当前缓存区尚未输出的字节数（范围 [0, 1MiB)）。
+    // 查询当前缓存区尚未输出的字节数（范围 [0, 当前批次大小)）。
     int pendingBytes() const;
 
     // ===== 诊断与自测 =====
     // 纯软件自测（不依赖 XDMA 设备）：
-    // 校验包格式、length 编码、补零，以及 1MiB 聚合边界行为。
+    // 校验包格式、length 编码、补零，以及“默认 1MiB”聚合边界行为。
     static bool runSelfTest(QString *report = nullptr);
 
 private:
@@ -67,6 +77,7 @@ private:
                                      int *packetCount = nullptr) const;
 
     RouteFields m_routeFields;
+    int m_batchBytes = kBatchBytes;
     QByteArray m_batchCache;
 };
 

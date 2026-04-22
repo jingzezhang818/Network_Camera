@@ -18,15 +18,34 @@ VideoPacketBatcher::RouteFields VideoPacketBatcher::defaultRouteFields()
 VideoPacketBatcher::VideoPacketBatcher(const RouteFields &routeFields)
     : m_routeFields(routeFields)
 {
-    // 缓存区按 1MiB 预留，可减少持续流输入时的扩容开销。
-    m_batchCache.reserve(kBatchBytes);
+    // 默认按 1MiB 预留，可减少持续流输入时的扩容开销。
+    m_batchCache.reserve(m_batchBytes);
 }
 
 // ===== 运行时处理 =====
 
+bool VideoPacketBatcher::setBatchBytes(int batchBytes)
+{
+    // 聚合批次必须按完整协议包对齐，避免打断 1024B 包边界。
+    if (batchBytes < kPacketSize || (batchBytes % kPacketSize) != 0) {
+        return false;
+    }
+
+    m_batchBytes = batchBytes;
+    if (m_batchCache.capacity() < m_batchBytes) {
+        m_batchCache.reserve(m_batchBytes);
+    }
+    return true;
+}
+
+int VideoPacketBatcher::batchBytes() const
+{
+    return m_batchBytes;
+}
+
 int VideoPacketBatcher::pendingBytes() const
 {
-    // 未满 1MiB 的数据会保留在缓存中，等待后续输入补齐。
+    // 未满一个批次的数据会保留在缓存中，等待后续输入补齐。
     return m_batchCache.size();
 }
 
@@ -109,15 +128,15 @@ VideoPacketBatcher::EnqueueResult VideoPacketBatcher::enqueueVideoPayload(
     for (int offset = 0; offset < packetStream.size(); offset += kPacketSize) {
         // 以完整协议包粒度入缓存，确保聚合不会打断包边界。
         m_batchCache.append(packetStream.constData() + offset, kPacketSize);
-        if (m_batchCache.size() == kBatchBytes) {
+        while (m_batchCache.size() >= m_batchBytes) {
             ++result.emittedBatchCount;
-            // 每凑满 1MiB 输出 1 个批次，随后清空缓存继续累积。
-            outBatches.append(m_batchCache);
-            m_batchCache.clear();
+            // 每凑满一个批次输出一次，剩余字节继续缓存。
+            outBatches.append(m_batchCache.left(m_batchBytes));
+            m_batchCache.remove(0, m_batchBytes);
         }
     }
 
-    result.emittedBatchBytes = result.emittedBatchCount * kBatchBytes;
+    result.emittedBatchBytes = result.emittedBatchCount * m_batchBytes;
     result.cachedBytes = m_batchCache.size();
     return result;
 }

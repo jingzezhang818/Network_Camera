@@ -103,8 +103,8 @@ public:
         Widget->setWindowTitle(QApplication::translate("Widget", "Camera Probe", nullptr));
         btnListModes->setText(QApplication::translate("Widget", "\345\210\227\345\207\272\346\250\241\345\274\217", nullptr));
         btnGrabOneFrame->setText(QApplication::translate("Widget", "\351\207\207\344\270\200\345\270\247", nullptr));
-        btnSendCapturedFrame->setText(QApplication::translate("Widget", "\345\217\221\351\200\201\347\274\223\345\255\230\345\270\247(\345\260\201\345\214\205+1MiB)", nullptr));
-        btnSendLiveVideo->setText(QApplication::translate("Widget", "\345\274\200\345\247\213\345\256\236\346\227\266\350\247\206\351\242\221\345\217\221\351\200\201(\345\260\201\345\214\205+1MiB)", nullptr));
+        btnSendCapturedFrame->setText(QApplication::translate("Widget", "\345\217\221\351\200\201\347\274\223\345\255\230\345\270\247(\345\260\201\345\214\205+\346\211\271\351\207\217)", nullptr));
+        btnSendLiveVideo->setText(QApplication::translate("Widget", "\345\274\200\345\247\213\345\256\236\346\227\266\350\247\206\351\242\221\345\217\221\351\200\201(\345\260\201\345\214\205+\346\211\271\351\207\217)", nullptr));
         btnOpenXdma->setText(QApplication::translate("Widget", "\346\211\223\345\274\200XDMA\351\200\232\351\201\223\345\271\266\350\207\252\346\243\200", nullptr));
         btnSendLinkTestPacket->setText(QApplication::translate("Widget", "\345\217\221\351\200\201XDMA\351\223\276\350\267\257\346\265\213\350\257\225\345\214\205", nullptr));
         btnSendTestPacket->setText(QApplication::translate("Widget", "\350\277\220\350\241\214\345\215\217\350\256\256\345\260\201\345\214\205\350\207\252\346\265\213", nullptr));

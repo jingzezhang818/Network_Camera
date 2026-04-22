@@ -32,15 +32,15 @@
      </item>
      <item>
       <widget class="QPushButton" name="btnSendCapturedFrame">
-       <property name="text">
-        <string>发送缓存帧(封包+1MiB)</string>
-       </property>
+        <property name="text">
+         <string>发送缓存帧(封包+批量)</string>
+        </property>
       </widget>
      </item>
      <item>
       <widget class="QPushButton" name="btnSendLiveVideo">
        <property name="text">
-        <string>开始实时视频发送(封包+1MiB)</string>
+        <string>开始实时视频发送(封包+批量)</string>
        </property>
       </widget>
      </item>

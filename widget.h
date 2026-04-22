@@ -64,7 +64,7 @@ private:
 
     // ===== 模块：视频业务发送（封包 + 聚合） =====
     // 视频发送专用入口：
-    // 原始视频流 -> 1024B 协议封包 -> 1MiB 聚合 -> sendXdmaPayload(single write)。
+    // 原始视频流 -> 1024B 协议封包 -> 可配置批次聚合 -> sendXdmaPayload(single write)。
     bool sendVideoPayloadWithBatching(const QByteArray &videoPayload,
                                       const QString &label,
                                       bool verbose = true);
@@ -83,7 +83,7 @@ private:
     bool openXdmaAndSelfCheck();
     // 底层 XDMA 发送函数（复用既有接口）：
     // - forceSingleWrite=false：沿用历史分块发送逻辑，兼容已有测试包/普通发送；
-    // - forceSingleWrite=true：用于 1MiB 批次路径，要求一次 write_device 完整写入。
+    // - forceSingleWrite=true：用于视频批次路径，要求一次 write_device 完整写入。
     bool sendXdmaPayload(const QByteArray &payload,
                          const QString &label,
                          bool verbose = true,
@@ -114,9 +114,11 @@ private:
     qint64 m_lastLiveSendMs = 0;
     int m_liveSentFrames = 0;
 
-    // 发送调参：节流间隔和分包大小都支持界面实时调整。
+    // 发送调参：节流间隔和写入批次大小都支持界面实时调整。
     // m_liveStreamThrottleMs：控制最小发送间隔（毫秒）。
-    // m_xdmaChunkBytes：控制每次 write_device 的最大分块字节数。
+    // m_xdmaChunkBytes：
+    // 1) 视频主链路中，控制每次向 XDMA 写入的批次大小；
+    // 2) 非单写路径中，仍作为 write_device 的最大分块字节数。
     qint64 m_liveStreamThrottleMs = 40;
     int m_xdmaChunkBytes = 1024 * 1024;
 
@@ -128,7 +130,7 @@ private:
     QByteArray m_lastCapturedFramePayload;
     QString m_lastCapturedFrameLabel;
 
-    // 视频流封包+聚合模块（1024B 包 -> 1MiB 批次）。
+    // 视频流封包+聚合模块（1024B 包 -> 可配置批次，默认 1MiB）。
     VideoPacketBatcher m_videoPacketBatcher;
 };
 
