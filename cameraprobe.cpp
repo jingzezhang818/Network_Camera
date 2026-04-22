@@ -2,10 +2,27 @@
 
 #include <QDebug>
 
+
+// ===== 模块：FrameGrabSurface（首帧采样 Surface）=====
+// 说明：负责 one-shot 首帧抓取，避免持续采样造成重复回调。
+
 // FrameGrabSurface 构造：仅做基类初始化。
 FrameGrabSurface::FrameGrabSurface(QObject *parent)
     : QAbstractVideoSurface(parent)
 {
+}
+
+// 设置当前抓帧任务关联的相机元信息（描述、设备名）。
+void FrameGrabSurface::setExpectedMeta(const QString &desc, const QString &devName)
+{
+    m_cameraDescription = desc;
+    m_deviceName = devName;
+}
+
+// 启用 one-shot：下一帧有效数据到达时抓取后即关闭等待状态。
+void FrameGrabSurface::armOneShot()
+{
+    m_waitingFirstFrame = true;
 }
 
 // 声明支持的像素格式集合。
@@ -21,19 +38,6 @@ QList<QVideoFrame::PixelFormat> FrameGrabSurface::supportedPixelFormats(
         formats << static_cast<QVideoFrame::PixelFormat>(i);
     }
     return formats;
-}
-
-// 设置当前抓帧任务关联的相机元信息（描述、设备名）。
-void FrameGrabSurface::setExpectedMeta(const QString &desc, const QString &devName)
-{
-    m_cameraDescription = desc;
-    m_deviceName = devName;
-}
-
-// 启用 one-shot：下一帧有效数据到达时抓取后即关闭等待状态。
-void FrameGrabSurface::armOneShot()
-{
-    m_waitingFirstFrame = true;
 }
 
 // Surface 收帧回调。
@@ -112,24 +116,10 @@ bool FrameGrabSurface::present(const QVideoFrame &frame)
     return true;
 }
 
-// CameraProbe 构造：注册元类型并初始化首帧超时计时器。
-CameraProbe::CameraProbe(QObject *parent)
-    : QObject(parent)
-{
-    qRegisterMetaType<CapturedFrame>("CapturedFrame");
+// ===== 模块：CameraProbe（外部抓拍控制器）=====
+// 说明：先给出模式查询静态接口，再给出会话生命周期和回调处理。
 
-    m_frameTimeout = new QTimer(this);
-    m_frameTimeout->setSingleShot(true);
-    connect(m_frameTimeout, &QTimer::timeout,
-            this, &CameraProbe::onCaptureTimeout);
-}
-
-// 析构时确保相机与 surface 被正确释放。
-CameraProbe::~CameraProbe()
-{
-    stopCapture();
-}
-
+// ----- 子模块：静态模式查询与选择 -----
 // 像素格式枚举转字符串，用于日志与 UI 可读展示。
 QString CameraProbe::pixelFormatToString(QVideoFrame::PixelFormat fmt)
 {
@@ -304,6 +294,25 @@ bool CameraProbe::findPreferredYuy2Mode(int width,
     return true;
 }
 
+// ----- 子模块：抓拍会话生命周期 -----
+// CameraProbe 构造：注册元类型并初始化首帧超时计时器。
+CameraProbe::CameraProbe(QObject *parent)
+    : QObject(parent)
+{
+    qRegisterMetaType<CapturedFrame>("CapturedFrame");
+
+    m_frameTimeout = new QTimer(this);
+    m_frameTimeout->setSingleShot(true);
+    connect(m_frameTimeout, &QTimer::timeout,
+            this, &CameraProbe::onCaptureTimeout);
+}
+
+// 析构时确保相机与 surface 被正确释放。
+CameraProbe::~CameraProbe()
+{
+    stopCapture();
+}
+
 // 启动单帧抓取流程：
 // - 重建 QCamera/Surface；
 // - 挂接信号槽；
@@ -390,6 +399,7 @@ void CameraProbe::stopCapture()
     }
 }
 
+// ----- 子模块：运行时回调处理 -----
 // 相机错误回调：上抛错误并异步停止抓取。
 void CameraProbe::onCameraError(QCamera::Error error)
 {

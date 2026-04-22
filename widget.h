@@ -13,6 +13,7 @@
 #include <QVideoProbe>
 #include <QByteArray>
 #include "cameraprobe.h"
+#include "video_packet_batcher.h"
 
 class QSpinBox;
 
@@ -29,24 +30,28 @@ public:
     ~Widget();
 
 private slots:
-    // UI 按钮槽：列出模式、抓帧、发送缓存帧、实时流开关、打开 XDMA、自检/测试包。
+    // ===== 按钮槽：采集与视频发送 =====
     void on_btnListModes_clicked();
     void on_btnGrabOneFrame_clicked();
     void on_btnSendCapturedFrame_clicked();
     void on_btnSendLiveVideo_clicked();
+
+    // ===== 按钮槽：XDMA 与测试 =====
     void on_btnOpenXdma_clicked();
+    void on_btnSendLinkTestPacket_clicked();
     void on_btnSendTestPacket_clicked();
 
-    // CameraProbe 回调槽：日志、成功、失败。
+    // ===== 回调槽：CameraProbe =====
     void onProbeLog(const QString &msg);
     void onProbeSuccess(const CapturedFrame &frame);
     void onProbeFailed(const QString &reason);
 
-    // 预览相机和预览探针回调。
+    // ===== 回调槽：预览链路 =====
     void onPreviewCameraError(QCamera::Error error);
     void onPreviewFrameProbed(const QVideoFrame &frame);
 
 private:
+    // ===== 模块：生命周期与预览初始化 =====
     // 初始化实时预览（QCameraViewfinder + QVideoProbe）。
     void initializePreview();
 
@@ -57,17 +62,33 @@ private:
     void startPreview();
     void stopPreview();
 
+    // ===== 模块：视频业务发送（封包 + 聚合） =====
+    // 视频发送专用入口：
+    // 原始视频流 -> 1024B 协议封包 -> 1MiB 聚合 -> sendXdmaPayload(single write)。
+    bool sendVideoPayloadWithBatching(const QByteArray &videoPayload,
+                                      const QString &label,
+                                      bool verbose = true);
+
+    // 软件自测入口（纯内存，不依赖 XDMA 设备），改为“手动触发”。
+    void runPacketModuleSelfTest();
+
+    // ===== 模块：XDMA 底层通道与发送 =====
+    // 关闭 XDMA 句柄，确保资源释放与状态复位。
+    void closeXdmaHandles();
     // XDMA 通道会话生命周期：
     // 1) 枚举设备并打开 user + h2c_0；
     // 2) 调用 ready_state 做轻量自检；
     // 3) 将负载写入 h2c_0；
     // 4) 程序退出或重连时关闭句柄。
     bool openXdmaAndSelfCheck();
-    bool sendXdmaPayload(const QByteArray &payload, const QString &label, bool verbose = true);
+    // 底层 XDMA 发送函数（复用既有接口）：
+    // - forceSingleWrite=false：沿用历史分块发送逻辑，兼容已有测试包/普通发送；
+    // - forceSingleWrite=true：用于 1MiB 批次路径，要求一次 write_device 完整写入。
+    bool sendXdmaPayload(const QByteArray &payload,
+                         const QString &label,
+                         bool verbose = true,
+                         bool forceSingleWrite = false);
     bool sendXdmaTestPacket();
-
-    // 关闭 XDMA 句柄，确保资源释放与状态复位。
-    void closeXdmaHandles();
 
     // Qt Designer 生成的 UI 对象。
     Ui::Widget *ui;
@@ -106,6 +127,9 @@ private:
     // 最近一次采集帧缓存，用于手动一键发送。
     QByteArray m_lastCapturedFramePayload;
     QString m_lastCapturedFrameLabel;
+
+    // 视频流封包+聚合模块（1024B 包 -> 1MiB 批次）。
+    VideoPacketBatcher m_videoPacketBatcher;
 };
 
 #endif // 头文件保护宏 WIDGET_H

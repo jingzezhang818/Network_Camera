@@ -10,6 +10,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QSpinBox>
+#include <QVector>
 #include <vector>
 #include <cstring>
 
@@ -107,7 +108,10 @@ Widget::Widget(QWidget *parent)
 {
     // 初始化 UI、按钮默认状态和预览链路。
     ui->setupUi(this);
-    ui->btnSendTestPacket->setEnabled(false);
+    // 软件协议自测不依赖 XDMA，可直接手动触发。
+    ui->btnSendTestPacket->setEnabled(true);
+    // 硬件链路测试包依赖 XDMA 通道就绪，初始禁用。
+    ui->btnSendLinkTestPacket->setEnabled(false);
     ui->btnSendCapturedFrame->setEnabled(false);
     initializePreview();
 
@@ -292,241 +296,12 @@ void Widget::stopPreview()
     m_previewCamera = nullptr;
 }
 
-// 关闭 XDMA 句柄并复位会话状态。
-void Widget::closeXdmaHandles()
-{
-    // 重连或退出时都要关闭两类句柄。
-    // 封装库内部通常用 CreateFile 打开通道，
-    // 因此每个成功打开的通道都必须对应 CloseHandle。
-    const HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
-    const HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+// ===== 模块：UI 操作入口（按钮槽）与采集回调 =====
+// 说明：
+// 1) 先放“用户可直接触发”的按钮入口，便于从上到下理解业务流程；
+// 2) 再放采集/预览回调，形成完整的“入口 -> 回调 -> 底层发送”阅读路径。
 
-    if (isValidHandle(h2c)) {
-        CloseHandle(h2c);
-    }
-    if (isValidHandle(user)) {
-        CloseHandle(user);
-    }
-
-    m_xdmaH2c0Handle = nullptr;
-    m_xdmaUserHandle = nullptr;
-    m_xdmaDevicePath.clear();
-
-    if (ui && ui->btnSendTestPacket) {
-        ui->btnSendTestPacket->setEnabled(false);
-    }
-}
-
-// 打开 XDMA 并做基础自检：
-// 1) 枚举设备；
-// 2) 打开 user 通道；
-// 3) 打开 h2c_0 通道；
-// 4) 读取 ready_state。
-bool Widget::openXdmaAndSelfCheck()
-{
-    // 重开策略：先清理旧句柄，再做一次完整打开流程。
-    closeXdmaHandles();
-
-    constexpr int kMaxDevices = 16;
-    constexpr size_t kPathLength = 1024;
-
-    std::vector<QByteArray> pathBuffers;
-    pathBuffers.reserve(kMaxDevices);
-    std::vector<char *> pathPtrs(kMaxDevices, nullptr);
-    for (int i = 0; i < kMaxDevices; ++i) {
-        pathBuffers.push_back(QByteArray(static_cast<int>(kPathLength), '\0'));
-        pathPtrs[i] = pathBuffers[i].data();
-    }
-
-    // 1) 枚举 GUID_DEVINTERFACE_XDMA 对应的基础设备路径。
-    // 封装函数会把每个设备路径写入传入的字符缓冲区。
-    const int deviceCount = get_devices(GUID_DEVINTERFACE_XDMA, pathPtrs.data(), kPathLength);
-    ui->plainTextEdit->appendPlainText(QString("[XDMA] detected devices: %1").arg(deviceCount));
-    if (deviceCount <= 0) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA device not found."));
-        return false;
-    }
-
-    const int scanCount = qMin(deviceCount, kMaxDevices);
-    int selectedIndex = -1;
-    for (int i = 0; i < scanCount; ++i) {
-        if (pathPtrs[i] && pathPtrs[i][0] != '\0') {
-            qInfo().noquote() << QString("[XDMA] device[%1] path: %2").arg(i).arg(pathPtrs[i]);
-            if (selectedIndex < 0) {
-                selectedIndex = i;
-            }
-        }
-    }
-
-    if (selectedIndex < 0) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA path list is empty."));
-        return false;
-    }
-
-    QByteArray basePath = QByteArray(pathPtrs[selectedIndex]);
-    if (basePath.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Invalid XDMA base path."));
-        return false;
-    }
-
-    m_xdmaDevicePath = QString::fromLocal8Bit(basePath.constData());
-    ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] selected path index=%1").arg(selectedIndex));
-
-    // 2) 先打开 user（控制/BAR）通道。
-    HANDLE userHandle = nullptr;
-    {
-        QByteArray userPath = basePath;
-        const int ok = open_devices(&userHandle,
-                                    GENERIC_READ | GENERIC_WRITE,
-                                    userPath.data(),
-                                    XDMA_FILE_USER);
-        if (ok != 1 || !isValidHandle(userHandle)) {
-            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Failed to open XDMA user channel."));
-            return false;
-        }
-    }
-
-    // 3) 打开 h2c_0 流发送通道，用于主机到 FPGA 的数据传输。
-    HANDLE h2cHandle = nullptr;
-    {
-        QByteArray h2cPath = basePath;
-        const int ok = open_devices(&h2cHandle,
-                                    GENERIC_WRITE,
-                                    h2cPath.data(),
-                                    XDMA_FILE_H2C_0);
-        if (ok != 1 || !isValidHandle(h2cHandle)) {
-            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Failed to open XDMA h2c_0 channel."));
-            CloseHandle(userHandle);
-            return false;
-        }
-    }
-
-    m_xdmaUserHandle = reinterpret_cast<void *>(userHandle);
-    m_xdmaH2c0Handle = reinterpret_cast<void *>(h2cHandle);
-
-    // 4) 调用 ready_state 做自检（具体语义由厂商 API 定义）。
-    unsigned int opState = 0;
-    unsigned int ddrState = 0;
-    const int readyRet = ready_state(userHandle, &opState, &ddrState);
-    if (readyRet < 0) {
-        ui->plainTextEdit->appendPlainText(
-                    QString("[WARN] ready_state failed: ret=%1").arg(readyRet));
-    } else {
-        ui->plainTextEdit->appendPlainText(
-                    QString("[OK] self-check: ready_state ret=%1, op=%2, ddr=%3")
-                    .arg(readyRet)
-                    .arg(opState)
-                    .arg(ddrState));
-    }
-
-    ui->btnSendTestPacket->setEnabled(true);
-    ui->plainTextEdit->appendPlainText(QStringLiteral("[OK] XDMA open complete: user + h2c_0 ready."));
-    return true;
-}
-
-// 通用 XDMA 发送函数。
-// 输入 payload 为“原始字节流”，函数内部负责：
-// - 自动打开 h2c_0（必要时）；
-// - 对齐缓冲区申请与拷贝；
-// - 分块 write_device 循环发送；
-// - 失败回滚与日志。
-bool Widget::sendXdmaPayload(const QByteArray &payload, const QString &label, bool verbose)
-{
-    // XDMA 通用发送路径，供以下场景复用：
-    // - 手动发送最近采集帧；
-    // - 发送测试包；
-    // - 实时视频流发送。
-    // 流程：
-    // 1) 如未打开通道则自动打开 XDMA；
-    // 2) 将 payload 拷贝到对齐缓冲区（allocate_buffer）；
-    // 3) 在 h2c_0 上分块写入，直到全部发送完成。
-    if (payload.isEmpty()) {
-        ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip XDMA send.").arg(label));
-        return false;
-    }
-
-    HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
-    if (!isValidHandle(h2c)) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[XDMA] h2c_0 is not open, trying auto-open..."));
-        if (!openXdmaAndSelfCheck()) {
-            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA auto-open failed."));
-            return false;
-        }
-        h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
-    }
-
-    if (!isValidHandle(h2c)) {
-        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] h2c_0 handle is invalid."));
-        return false;
-    }
-
-    const int totalBytes = payload.size();
-    BYTE *txBuffer = allocate_buffer(static_cast<size_t>(totalBytes), 0);
-    if (!txBuffer) {
-        ui->plainTextEdit->appendPlainText(QString("[ERROR] allocate_buffer failed for %1 (%2 bytes).")
-                                           .arg(label)
-                                           .arg(totalBytes));
-        return false;
-    }
-
-    std::memcpy(txBuffer, payload.constData(), static_cast<size_t>(totalBytes));
-
-    int sent = 0;
-    // 分块发送可提升大包写入的稳定性，也更方便定位问题。
-    const int chunkBytes = qMax(4 * 1024, m_xdmaChunkBytes);
-    while (sent < totalBytes) {
-        const int remain = totalBytes - sent;
-        const DWORD req = static_cast<DWORD>(qMin(remain, chunkBytes));
-        const int written = write_device(h2c, 0x00000000, req, txBuffer + sent);
-        if (written <= 0) {
-            free_buffer(txBuffer);
-            ui->plainTextEdit->appendPlainText(
-                        QString("[ERROR] XDMA write failed while sending %1: sent=%2/%3, ret=%4")
-                        .arg(label)
-                        .arg(sent)
-                        .arg(totalBytes)
-                        .arg(written));
-            return false;
-        }
-        sent += written;
-    }
-
-    free_buffer(txBuffer);
-    if (verbose) {
-        ui->plainTextEdit->appendPlainText(
-                    QString("[OK] XDMA sent %1: %2 bytes")
-                    .arg(label)
-                    .arg(sent));
-    }
-    return true;
-}
-
-// 发送固定测试包，用于验证 PC->FPGA H2C 通道连通性。
-bool Widget::sendXdmaTestPacket()
-{
-    // 4KB 固定模式测试包，用于链路连通性验证。
-    // 头部 [0..3]="XDMA"， [4..7]=序号。
-    constexpr int packetSize = 4096;
-    QByteArray payload(packetSize, '\0');
-    BYTE *buffer = reinterpret_cast<BYTE *>(payload.data());
-
-    for (int i = 0; i < packetSize; ++i) {
-        buffer[i] = static_cast<BYTE>((i + 0x5A) & 0xFF);
-    }
-
-    buffer[0] = 'X';
-    buffer[1] = 'D';
-    buffer[2] = 'M';
-    buffer[3] = 'A';
-    static quint32 sequence = 0;
-    ++sequence;
-    std::memcpy(buffer + 4, &sequence, sizeof(sequence));
-
-    return sendXdmaPayload(payload,
-                           QString("test packet to h2c_0 (seq=%1)").arg(sequence));
-}
-
+// ----- 子模块：采集与视频发送按钮 -----
 // 列出相机与模式信息。
 // 该函数用于联调阶段快速确认：设备可见性、驱动是否返回模式列表。
 void Widget::on_btnListModes_clicked()
@@ -664,34 +439,34 @@ void Widget::on_btnSendCapturedFrame_clicked()
     const QString label = m_lastCapturedFrameLabel.isEmpty()
             ? QStringLiteral("cached camera frame")
             : m_lastCapturedFrameLabel;
-    sendXdmaPayload(m_lastCapturedFramePayload, label);
+    sendVideoPayloadWithBatching(m_lastCapturedFramePayload, label);
 }
 
 // 实时发送开关按钮。
 // 开启后由 onPreviewFrameProbed 持续处理帧并发送；关闭后仅保留预览不发送。
 void Widget::on_btnSendLiveVideo_clicked()
 {
-    // 运行时开关路径：预览帧 -> QVideoProbe -> sendXdmaPayload -> h2c_0。
+    // 运行时开关路径：预览帧 -> QVideoProbe -> sendVideoPayloadWithBatching -> h2c_0。
     // 这里只切换“是否发送”，不改变相机采集参数。
     if (!m_liveVideoSending) {
         m_liveVideoSending = true;
         m_lastLiveSendMs = 0;
         m_liveSentFrames = 0;
-                ui->btnSendLiveVideo->setText(QString::fromUtf8("停止发送实时视频到H2C"));
-        ui->plainTextEdit->appendPlainText(
-                    QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
+        ui->btnSendLiveVideo->setText(QString::fromUtf8("停止实时视频发送(封包+1MiB)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[XDMA] Live camera streaming to h2c_0 started."));
         return;
     }
 
     m_liveVideoSending = false;
-    ui->btnSendLiveVideo->setText(QString::fromUtf8("开始发送实时视频到H2C"));
+    ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+1MiB)"));
     ui->plainTextEdit->appendPlainText(
-                QString("[XDMA] Live camera streaming stopped. sent frames=%1")
-                .arg(m_liveSentFrames));
+                QString("[XDMA] Live camera streaming stopped. sent frames=%1, cached-not-sent=%2 bytes")
+                .arg(m_liveSentFrames)
+                .arg(m_videoPacketBatcher.pendingBytes()));
 }
 
+// ----- 子模块：XDMA 与测试按钮 -----
 // 手动打开 XDMA 并执行 ready_state 自检。
 void Widget::on_btnOpenXdma_clicked()
 {
@@ -703,10 +478,21 @@ void Widget::on_btnOpenXdma_clicked()
 // 发送测试包按钮槽。
 void Widget::on_btnSendTestPacket_clicked()
 {
-    // 无相机依赖的固定测试包路径，用于快速验证链路。
+    // 手动触发软件侧封包/聚合自测：
+    // 1) 验证 1024B 包头字段、length 与补零规则；
+    // 2) 验证 1024 包是否准确聚合为 1MiB。
+    runPacketModuleSelfTest();
+}
+
+// XDMA 链路测试包按钮槽。
+void Widget::on_btnSendLinkTestPacket_clicked()
+{
+    // 无相机依赖的固定测试包路径，用于快速验证 PC->FPGA H2C 链路。
+    // 与“软件协议自测”分开，避免测试职责混用。
     sendXdmaTestPacket();
 }
 
+// ----- 子模块：采集与预览回调 -----
 // 透传 CameraProbe 日志到界面。
 void Widget::onProbeLog(const QString &msg)
 {
@@ -827,7 +613,7 @@ void Widget::onPreviewCameraError(QCamera::Error error)
 // 预览帧回调（实时发送主链路）：
 // 1) 根据开关和节流条件决定是否发送；
 // 2) map 帧并拷贝原始字节；
-// 3) 调用 sendXdmaPayload 发送到 h2c_0；
+// 3) 调用 sendVideoPayloadWithBatching 完成“封包+聚合+发送”；
 // 4) 错误时自动停流并回退 UI 状态。
 void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
 {
@@ -871,17 +657,17 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
     }
 
     m_lastLiveSendMs = nowMs;
-    const bool ok = sendXdmaPayload(payload,
-                                    QString("live frame %1x%2 %3")
-                                    .arg(width)
-                                    .arg(height)
-                                    .arg(CameraProbe::pixelFormatToString(fmt)),
-                                    false);
+    const bool ok = sendVideoPayloadWithBatching(payload,
+                                                 QString("live frame %1x%2 %3")
+                                                 .arg(width)
+                                                 .arg(height)
+                                                 .arg(CameraProbe::pixelFormatToString(fmt)),
+                                                 false);
 
     if (!ok) {
         // 发送失败即停流，避免持续错误刷屏和驱动压力累积。
         m_liveVideoSending = false;
-        ui->btnSendLiveVideo->setText(QString::fromUtf8("开始发送实时视频到H2C"));
+        ui->btnSendLiveVideo->setText(QString::fromUtf8("开始实时视频发送(封包+1MiB)"));
         ui->plainTextEdit->appendPlainText(
                     QStringLiteral("[ERROR] Live camera streaming stopped due to XDMA write failure."));
         return;
@@ -893,4 +679,335 @@ void Widget::onPreviewFrameProbed(const QVideoFrame &frame)
                     QString("[XDMA] Live stream progress: sent frames=%1")
                     .arg(m_liveSentFrames));
     }
+}
+
+// ===== 模块：传输与 XDMA 底层实现 =====
+// 说明：
+// 1) 该模块只承载“通道管理 + 发送执行 + 自测执行”；
+// 2) 上层按钮/回调只调用本模块，不直接触碰驱动细节。
+
+// ----- 子模块：XDMA 通道管理 -----
+// 关闭 XDMA 句柄并复位会话状态。
+void Widget::closeXdmaHandles()
+{
+    // 重连或退出时都要关闭两类句柄。
+    // 封装库内部通常用 CreateFile 打开通道，
+    // 因此每个成功打开的通道都必须对应 CloseHandle。
+    const HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+    const HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+
+    if (isValidHandle(h2c)) {
+        CloseHandle(h2c);
+    }
+    if (isValidHandle(user)) {
+        CloseHandle(user);
+    }
+
+    m_xdmaH2c0Handle = nullptr;
+    m_xdmaUserHandle = nullptr;
+    m_xdmaDevicePath.clear();
+
+    if (ui && ui->btnSendLinkTestPacket) {
+        ui->btnSendLinkTestPacket->setEnabled(false);
+    }
+}
+
+// 打开 XDMA 并做基础自检：
+// 1) 枚举设备；
+// 2) 打开 user 通道；
+// 3) 打开 h2c_0 通道；
+// 4) 读取 ready_state。
+bool Widget::openXdmaAndSelfCheck()
+{
+    // 重开策略：先清理旧句柄，再做一次完整打开流程。
+    closeXdmaHandles();
+
+    constexpr int kMaxDevices = 16;
+    constexpr size_t kPathLength = 1024;
+
+    std::vector<QByteArray> pathBuffers;
+    pathBuffers.reserve(kMaxDevices);
+    std::vector<char *> pathPtrs(kMaxDevices, nullptr);
+    for (int i = 0; i < kMaxDevices; ++i) {
+        pathBuffers.push_back(QByteArray(static_cast<int>(kPathLength), '\0'));
+        pathPtrs[i] = pathBuffers[i].data();
+    }
+
+    // 1) 枚举 GUID_DEVINTERFACE_XDMA 对应的基础设备路径。
+    // 封装函数会把每个设备路径写入传入的字符缓冲区。
+    const int deviceCount = get_devices(GUID_DEVINTERFACE_XDMA, pathPtrs.data(), kPathLength);
+    ui->plainTextEdit->appendPlainText(QString("[XDMA] detected devices: %1").arg(deviceCount));
+    if (deviceCount <= 0) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA device not found."));
+        return false;
+    }
+
+    const int scanCount = qMin(deviceCount, kMaxDevices);
+    int selectedIndex = -1;
+    for (int i = 0; i < scanCount; ++i) {
+        if (pathPtrs[i] && pathPtrs[i][0] != '\0') {
+            qInfo().noquote() << QString("[XDMA] device[%1] path: %2").arg(i).arg(pathPtrs[i]);
+            if (selectedIndex < 0) {
+                selectedIndex = i;
+            }
+        }
+    }
+
+    if (selectedIndex < 0) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA path list is empty."));
+        return false;
+    }
+
+    QByteArray basePath = QByteArray(pathPtrs[selectedIndex]);
+    if (basePath.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Invalid XDMA base path."));
+        return false;
+    }
+
+    m_xdmaDevicePath = QString::fromLocal8Bit(basePath.constData());
+    ui->plainTextEdit->appendPlainText(
+                QString("[XDMA] selected path index=%1").arg(selectedIndex));
+
+    // 2) 先打开 user（控制/BAR）通道。
+    HANDLE userHandle = nullptr;
+    {
+        QByteArray userPath = basePath;
+        const int ok = open_devices(&userHandle,
+                                    GENERIC_READ | GENERIC_WRITE,
+                                    userPath.data(),
+                                    XDMA_FILE_USER);
+        if (ok != 1 || !isValidHandle(userHandle)) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Failed to open XDMA user channel."));
+            return false;
+        }
+    }
+
+    // 3) 打开 h2c_0 流发送通道，用于主机到 FPGA 的数据传输。
+    HANDLE h2cHandle = nullptr;
+    {
+        QByteArray h2cPath = basePath;
+        const int ok = open_devices(&h2cHandle,
+                                    GENERIC_WRITE,
+                                    h2cPath.data(),
+                                    XDMA_FILE_H2C_0);
+        if (ok != 1 || !isValidHandle(h2cHandle)) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] Failed to open XDMA h2c_0 channel."));
+            CloseHandle(userHandle);
+            return false;
+        }
+    }
+
+    m_xdmaUserHandle = reinterpret_cast<void *>(userHandle);
+    m_xdmaH2c0Handle = reinterpret_cast<void *>(h2cHandle);
+
+    // 4) 调用 ready_state 做自检（具体语义由厂商 API 定义）。
+    unsigned int opState = 0;
+    unsigned int ddrState = 0;
+    const int readyRet = ready_state(userHandle, &opState, &ddrState);
+    if (readyRet < 0) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[WARN] ready_state failed: ret=%1").arg(readyRet));
+    } else {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[OK] self-check: ready_state ret=%1, op=%2, ddr=%3")
+                    .arg(readyRet)
+                    .arg(opState)
+                    .arg(ddrState));
+    }
+
+    ui->btnSendLinkTestPacket->setEnabled(true);
+    ui->plainTextEdit->appendPlainText(QStringLiteral("[OK] XDMA open complete: user + h2c_0 ready."));
+    return true;
+}
+
+// ----- 子模块：发送执行（底层/业务桥接） -----
+// 通用 XDMA 发送函数。
+// 输入 payload 为“原始字节流”，函数内部负责：
+// - 自动打开 h2c_0（必要时）；
+// - 对齐缓冲区申请与拷贝；
+// - 默认分块 write_device 循环发送，forceSingleWrite 时单次发送；
+// - 失败回滚与日志。
+bool Widget::sendXdmaPayload(const QByteArray &payload,
+                             const QString &label,
+                             bool verbose,
+                             bool forceSingleWrite)
+{
+    // XDMA 通用发送路径，供以下场景复用：
+    // - 手动发送最近采集帧；
+    // - 发送测试包；
+    // - 实时视频流发送。
+    // 流程：
+    // 1) 如未打开通道则自动打开 XDMA；
+    // 2) 将 payload 拷贝到对齐缓冲区（allocate_buffer）；
+    // 3) 在 h2c_0 上写入（forceSingleWrite=true 时严格单次写入）。
+    if (payload.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip XDMA send.").arg(label));
+        return false;
+    }
+
+    HANDLE h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+    if (!isValidHandle(h2c)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[XDMA] h2c_0 is not open, trying auto-open..."));
+        if (!openXdmaAndSelfCheck()) {
+            ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] XDMA auto-open failed."));
+            return false;
+        }
+        h2c = reinterpret_cast<HANDLE>(m_xdmaH2c0Handle);
+    }
+
+    if (!isValidHandle(h2c)) {
+        ui->plainTextEdit->appendPlainText(QStringLiteral("[ERROR] h2c_0 handle is invalid."));
+        return false;
+    }
+
+    const int totalBytes = payload.size();
+    BYTE *txBuffer = allocate_buffer(static_cast<size_t>(totalBytes), 0);
+    if (!txBuffer) {
+        ui->plainTextEdit->appendPlainText(QString("[ERROR] allocate_buffer failed for %1 (%2 bytes).")
+                                           .arg(label)
+                                           .arg(totalBytes));
+        return false;
+    }
+
+    std::memcpy(txBuffer, payload.constData(), static_cast<size_t>(totalBytes));
+
+    int sent = 0;
+    if (forceSingleWrite) {
+        // 1MiB 聚合路径要求“一批一写”：
+        // 若驱动返回值不是 totalBytes，视为失败并立即上报，避免
+        // 上层误以为该批已经完整送达 FPGA。
+        const int written = write_device(h2c,
+                                         0x00000000,
+                                         static_cast<DWORD>(totalBytes),
+                                         txBuffer);
+        if (written != totalBytes) {
+            free_buffer(txBuffer);
+            ui->plainTextEdit->appendPlainText(
+                        QString("[ERROR] XDMA single-write failed for %1: sent=%2/%3, ret=%4")
+                        .arg(label)
+                        .arg(qMax(0, written))
+                        .arg(totalBytes)
+                        .arg(written));
+            return false;
+        }
+        sent = written;
+    } else {
+        // 历史兼容路径：
+        // 分块发送可提升大包写入稳定性，也更便于定位失败位置。
+        // 注意：视频主链路不会走这个分支。
+        const int chunkBytes = qMax(4 * 1024, m_xdmaChunkBytes);
+        while (sent < totalBytes) {
+            const int remain = totalBytes - sent;
+            const DWORD req = static_cast<DWORD>(qMin(remain, chunkBytes));
+            const int written = write_device(h2c, 0x00000000, req, txBuffer + sent);
+            if (written <= 0) {
+                free_buffer(txBuffer);
+                ui->plainTextEdit->appendPlainText(
+                            QString("[ERROR] XDMA write failed while sending %1: sent=%2/%3, ret=%4")
+                            .arg(label)
+                            .arg(sent)
+                            .arg(totalBytes)
+                            .arg(written));
+                return false;
+            }
+            sent += written;
+        }
+    }
+
+    free_buffer(txBuffer);
+    if (verbose) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[OK] XDMA sent %1: %2 bytes")
+                    .arg(label)
+                    .arg(sent));
+    }
+    return true;
+}
+
+// 视频数据发送链路：
+// 原始视频字节流 -> 1024B 封包 -> 1MiB 聚合 -> XDMA 发送。
+bool Widget::sendVideoPayloadWithBatching(const QByteArray &videoPayload,
+                                          const QString &label,
+                                          bool verbose)
+{
+    if (videoPayload.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(QString("[ERROR] %1 is empty, skip video packetization.").arg(label));
+        return false;
+    }
+
+    QVector<QByteArray> readyBatches;
+    const VideoPacketBatcher::EnqueueResult result =
+            m_videoPacketBatcher.enqueueVideoPayload(videoPayload, readyBatches);
+
+    // [PKG] 日志用于观察三层关系：
+    // - raw：输入原始视频字节数；
+    // - packets：本次封包后的 1024B 包数量；
+    // - emitted/cached：本次发出的 1MiB 批次数与剩余缓存字节。
+    if (verbose || !readyBatches.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[PKG] %1 raw=%2B -> packets=%3 (%4B), emitted=%5 x 1MiB, cached=%6B")
+                    .arg(label)
+                    .arg(result.inputBytes)
+                    .arg(result.packetCount)
+                    .arg(result.packetBytes)
+                    .arg(result.emittedBatchCount)
+                    .arg(result.cachedBytes));
+    }
+
+    for (int i = 0; i < readyBatches.size(); ++i) {
+        // 每个 readyBatches[i] 必然是完整 1MiB，且在此处强制单次 write。
+        const bool ok = sendXdmaPayload(readyBatches[i],
+                                        QString("%1 [1MiB batch %2/%3]")
+                                        .arg(label)
+                                        .arg(i + 1)
+                                        .arg(readyBatches.size()),
+                                        false,
+                                        true);
+        if (!ok) {
+            ui->plainTextEdit->appendPlainText(
+                        QString("[ERROR] Failed to send 1MiB batch for %1 at index=%2")
+                        .arg(label)
+                        .arg(i + 1));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ----- 子模块：测试执行 -----
+// 发送固定测试包，用于验证 PC->FPGA H2C 通道连通性。
+bool Widget::sendXdmaTestPacket()
+{
+    // 4KB 固定模式测试包，用于链路连通性验证。
+    // 头部 [0..3]="XDMA"， [4..7]=序号。
+    constexpr int packetSize = 4096;
+    QByteArray payload(packetSize, '\0');
+    BYTE *buffer = reinterpret_cast<BYTE *>(payload.data());
+
+    for (int i = 0; i < packetSize; ++i) {
+        buffer[i] = static_cast<BYTE>((i + 0x5A) & 0xFF);
+    }
+
+    buffer[0] = 'X';
+    buffer[1] = 'D';
+    buffer[2] = 'M';
+    buffer[3] = 'A';
+    static quint32 sequence = 0;
+    ++sequence;
+    std::memcpy(buffer + 4, &sequence, sizeof(sequence));
+
+    return sendXdmaPayload(payload,
+                           QString("test packet to h2c_0 (seq=%1)").arg(sequence));
+}
+
+void Widget::runPacketModuleSelfTest()
+{
+    // 该函数只做纯软件协议自测，不访问 XDMA 设备：
+    // 因此即便未打开硬件，也可以单独验证封包与聚合规则。
+    QString report;
+    const bool ok = VideoPacketBatcher::runSelfTest(&report);
+    ui->plainTextEdit->appendPlainText(
+                ok ? QString("[SELFTEST] %1").arg(report)
+                   : QString("[SELFTEST][ERROR] %1").arg(report));
 }

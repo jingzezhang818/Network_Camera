@@ -56,15 +56,16 @@ class FrameGrabSurface : public QAbstractVideoSurface
 public:
     explicit FrameGrabSurface(QObject *parent = nullptr);
 
-    QList<QVideoFrame::PixelFormat> supportedPixelFormats(
-            QAbstractVideoBuffer::HandleType type = QAbstractVideoBuffer::NoHandle) const override;
-
-    bool present(const QVideoFrame &frame) override;
-
+    // 设置当前抓帧任务关联的相机元信息（描述、设备名）。
     void setExpectedMeta(const QString &desc, const QString &devName);
 
     // 打开一次性抓帧开关：下一帧有效帧到达即抓取。
     void armOneShot();
+
+    // QAbstractVideoSurface 覆写：声明支持的像素格式并接收帧回调。
+    QList<QVideoFrame::PixelFormat> supportedPixelFormats(
+            QAbstractVideoBuffer::HandleType type = QAbstractVideoBuffer::NoHandle) const override;
+    bool present(const QVideoFrame &frame) override;
 
 signals:
     void logMessage(const QString &msg);
@@ -88,13 +89,14 @@ public:
     explicit CameraProbe(QObject *parent = nullptr);
     ~CameraProbe() override;
 
+    // ===== 静态模式查询与选择 =====
+    // 像素格式枚举转可读字符串，便于日志展示。
+    static QString pixelFormatToString(QVideoFrame::PixelFormat fmt);
+
     static QList<CameraModeInfo> enumerateAllModes();
 
     // 仅筛选 YUY2/YUYV 模式，供上层优先抓取。
     static QList<CameraModeInfo> enumerateYuy2Modes();
-
-    // 像素格式枚举转可读字符串，便于日志展示。
-    static QString pixelFormatToString(QVideoFrame::PixelFormat fmt);
 
     // 按优先级寻找模式：
     // 1) 精确匹配宽高 + YUY2；
@@ -105,6 +107,7 @@ public:
                                       CameraModeInfo &outMode,
                                       QString *reason = nullptr);
 
+    // ===== 抓拍会话生命周期 =====
     // 启动一次单帧抓取。
     bool startSingleFrameCapture(const CameraModeInfo &mode);
 
@@ -117,6 +120,7 @@ signals:
     void captureFailed(const QString &reason);
 
 private slots:
+    // ===== 运行时回调处理 =====
     // 相机错误回调。
     void onCameraError(QCamera::Error error);
 

@@ -24,10 +24,12 @@ win32-g++ {
 SOURCES += \
     cameraprobe.cpp \
     main.cpp \
+    video_packet_batcher.cpp \
     widget.cpp
 
 HEADERS += \
     cameraprobe.h \
+    video_packet_batcher.h \
     widget.h
 
 FORMS += \

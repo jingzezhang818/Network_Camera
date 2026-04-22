@@ -30,34 +30,41 @@
        </property>
       </widget>
      </item>
-   <item>
-    <widget class="QPushButton" name="btnSendCapturedFrame">
-     <property name="text">
-      <string>发送最近一帧到H2C_0</string>
-     </property>
-    </widget>
-   </item>
      <item>
-      <widget class="QPushButton" name="btnSendLiveVideo">
+      <widget class="QPushButton" name="btnSendCapturedFrame">
        <property name="text">
-        <string>开始发送实时视频到H2C</string>
+        <string>发送缓存帧(封包+1MiB)</string>
        </property>
       </widget>
      </item>
-         <item>
-            <widget class="QPushButton" name="btnOpenXdma">
-             <property name="text">
-                <string>打开XDMA并自检</string>
-             </property>
-            </widget>
-         </item>
-         <item>
-            <widget class="QPushButton" name="btnSendTestPacket">
-             <property name="text">
-                <string>发送测试包到H2C_0</string>
-             </property>
-            </widget>
-         </item>
+     <item>
+      <widget class="QPushButton" name="btnSendLiveVideo">
+       <property name="text">
+        <string>开始实时视频发送(封包+1MiB)</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnOpenXdma">
+       <property name="text">
+        <string>打开XDMA通道并自检</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnSendLinkTestPacket">
+       <property name="text">
+        <string>发送XDMA链路测试包</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnSendTestPacket">
+       <property name="text">
+        <string>运行协议封包自测</string>
+       </property>
+      </widget>
+     </item>
      <item>
       <spacer name="horizontalSpacer">
        <property name="orientation">
