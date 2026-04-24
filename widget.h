@@ -16,6 +16,7 @@
 #include "video_packet_batcher.h"
 
 class QSpinBox;
+class QLineEdit;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class Widget; }
@@ -55,8 +56,11 @@ private:
     // 初始化实时预览（QCameraViewfinder + QVideoProbe）。
     void initializePreview();
 
-    // 初始化“节流间隔/分包大小”调参控件，并绑定运行时参数。
+    // 初始化“节流间隔/写入大小”调参控件，并绑定运行时参数。
     void initializeTransferControls();
+    // 初始化 AXI lite 寄存器读写控件（地址/写值输入、读值显示、读写按钮）。
+    // 该区域是“寄存器调试入口”，与视频发送链路解耦。
+    void initializeAxiLiteControls();
 
     // 启动/停止实时预览相机。
     void startPreview();
@@ -89,6 +93,20 @@ private:
                          bool verbose = true,
                          bool forceSingleWrite = false);
     bool sendXdmaTestPacket();
+    // AXI lite 寄存器读写（通过 user 通道）：
+    // - 地址与数据均按 32bit 处理；
+    // - 地址要求 4 字节对齐；
+    // - 如 user 通道未打开，内部会尝试自动打开 XDMA。
+    // 返回值约定：
+    // - true：访问成功；
+    // - false：参数非法、通道不可用或底层 read/write 失败。
+    bool readUserRegister(quint32 address, quint32 &value);
+    bool writeUserRegister(quint32 address, quint32 value);
+    // 解析 UI 输入的寄存器地址/数值（支持 0x 前缀或十进制）。
+    // 解析结果限制在 uint32 范围内，超界或格式错误会返回 false 并写日志。
+    bool parseUiRegisterValue(const QString &text,
+                              quint32 &outValue,
+                              const QString &fieldName);
 
     // Qt Designer 生成的 UI 对象。
     Ui::Widget *ui;
@@ -125,6 +143,13 @@ private:
     // 对应的界面调参控件指针。
     QSpinBox *m_throttleSpin = nullptr;
     QSpinBox *m_chunkSizeSpin = nullptr;
+    // AXI lite 寄存器调试区控件：
+    // - m_regAddrEdit：寄存器地址输入；
+    // - m_regWriteValueEdit：写寄存器数据输入；
+    // - m_regReadValueEdit：读寄存器结果显示（只读）。
+    QLineEdit *m_regAddrEdit = nullptr;
+    QLineEdit *m_regWriteValueEdit = nullptr;
+    QLineEdit *m_regReadValueEdit = nullptr;
 
     // 最近一次采集帧缓存，用于手动一键发送。
     QByteArray m_lastCapturedFramePayload;

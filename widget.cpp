@@ -10,6 +10,8 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QSpinBox>
+#include <QLineEdit>
+#include <QPushButton>
 #include <QVector>
 #include <vector>
 #include <cstring>
@@ -35,6 +37,13 @@ int clampToByte(int value)
         return 255;
     }
     return value;
+}
+
+// 统一输出 32bit 十六进制文本（大写、固定 8 位）。
+// 用于寄存器读写日志与“读回值”展示，减少格式不一致问题。
+QString toHex32(quint32 value)
+{
+    return QString("0x%1").arg(value, 8, 16, QLatin1Char('0')).toUpper();
 }
 
 // 将一帧 YUYV 原始数据转换为 RGB888 图像。
@@ -140,6 +149,7 @@ void Widget::initializePreview()
 
     ui->verticalLayout->insertWidget(1, m_viewfinder, 1);
     initializeTransferControls();
+    initializeAxiLiteControls();
 
     m_videoProbe = new QVideoProbe(this);
     connect(m_videoProbe, &QVideoProbe::videoFrameProbed,
@@ -219,6 +229,115 @@ void Widget::initializeTransferControls()
 
     // 让封包聚合模块与 UI 初始值保持一致。
     m_videoPacketBatcher.setBatchBytes(m_xdmaChunkBytes);
+}
+
+// 在界面中动态创建 AXI lite 寄存器调试区：
+// - 地址输入：支持十六进制（0x）或十进制；
+// - 写值输入：用于 32bit 写寄存器；
+// - 读值显示：展示最近一次读取结果；
+// - 读/写按钮：通过 XDMA user 通道访问 AXI lite。
+void Widget::initializeAxiLiteControls()
+{
+    // 该 panel 放在主界面布局中，提供 AXI lite 读写入口。
+    // 采用“输入地址 + 读/写按钮 + 读回显示”的最小调试闭环。
+    QWidget *panel = new QWidget(this);
+    panel->setObjectName("axiLiteRegPanel");
+
+    QHBoxLayout *row = new QHBoxLayout(panel);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(8);
+
+    QLabel *addrLabel = new QLabel(
+                QString::fromWCharArray(L"寄存器地址:"), panel);
+    m_regAddrEdit = new QLineEdit(panel);
+    m_regAddrEdit->setPlaceholderText("0x00000000");
+    m_regAddrEdit->setText("0x00000000");
+    m_regAddrEdit->setMaximumWidth(130);
+
+    QLabel *writeLabel = new QLabel(
+                QString::fromWCharArray(L"写入值:"), panel);
+    m_regWriteValueEdit = new QLineEdit(panel);
+    m_regWriteValueEdit->setPlaceholderText("0x00000000");
+    m_regWriteValueEdit->setText("0x00000000");
+    m_regWriteValueEdit->setMaximumWidth(130);
+
+    QPushButton *readBtn = new QPushButton(
+                QString::fromWCharArray(L"读寄存器"), panel);
+    QPushButton *writeBtn = new QPushButton(
+                QString::fromWCharArray(L"写寄存器"), panel);
+
+    QLabel *readbackLabel = new QLabel(
+                QString::fromWCharArray(L"读回值:"), panel);
+    m_regReadValueEdit = new QLineEdit(panel);
+    m_regReadValueEdit->setReadOnly(true);
+    m_regReadValueEdit->setText("0x00000000");
+    m_regReadValueEdit->setMaximumWidth(130);
+
+    row->addWidget(addrLabel);
+    row->addWidget(m_regAddrEdit);
+    row->addWidget(writeLabel);
+    row->addWidget(m_regWriteValueEdit);
+    row->addWidget(readBtn);
+    row->addWidget(writeBtn);
+    row->addWidget(readbackLabel);
+    row->addWidget(m_regReadValueEdit);
+    row->addStretch(1);
+
+    connect(readBtn, &QPushButton::clicked, this, [this]() {
+        // 读寄存器流程：
+        // 1) 解析地址；
+        // 2) 调用 user 通道 read_device；
+        // 3) 更新读回框并写日志。
+        quint32 address = 0;
+        if (!parseUiRegisterValue(m_regAddrEdit ? m_regAddrEdit->text() : QString(),
+                                  address,
+                                  QStringLiteral("register address"))) {
+            return;
+        }
+
+        quint32 value = 0;
+        if (!readUserRegister(address, value)) {
+            return;
+        }
+
+        if (m_regReadValueEdit) {
+            m_regReadValueEdit->setText(toHex32(value));
+        }
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL] READ  addr=%1 -> value=%2")
+                    .arg(toHex32(address))
+                    .arg(toHex32(value)));
+    });
+
+    connect(writeBtn, &QPushButton::clicked, this, [this]() {
+        // 写寄存器流程：
+        // 1) 解析地址与写值；
+        // 2) 调用 user 通道 write_device；
+        // 3) 写日志确认本次写入参数。
+        quint32 address = 0;
+        quint32 value = 0;
+        if (!parseUiRegisterValue(m_regAddrEdit ? m_regAddrEdit->text() : QString(),
+                                  address,
+                                  QStringLiteral("register address"))) {
+            return;
+        }
+        if (!parseUiRegisterValue(m_regWriteValueEdit ? m_regWriteValueEdit->text() : QString(),
+                                  value,
+                                  QStringLiteral("register write value"))) {
+            return;
+        }
+
+        if (!writeUserRegister(address, value)) {
+            return;
+        }
+
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL] WRITE addr=%1 <- value=%2")
+                    .arg(toHex32(address))
+                    .arg(toHex32(value)));
+    });
+
+    ui->verticalLayout->insertWidget(3, panel);
 }
 
 // 启动实时预览。
@@ -831,6 +950,128 @@ bool Widget::openXdmaAndSelfCheck()
 
     ui->btnSendLinkTestPacket->setEnabled(true);
     ui->plainTextEdit->appendPlainText(QStringLiteral("[OK] XDMA open complete: user + h2c_0 ready."));
+    return true;
+}
+
+bool Widget::parseUiRegisterValue(const QString &text,
+                                  quint32 &outValue,
+                                  const QString &fieldName)
+{
+    // 输入支持：
+    // - 16进制：如 0x80、0x0C、0X1；
+    // - 10进制：如 128。
+    // toULongLong(base=0) 会按前缀自动识别进制。
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] %1 is empty.").arg(fieldName));
+        return false;
+    }
+
+    bool ok = false;
+    const qulonglong raw = trimmed.toULongLong(&ok, 0);
+    if (!ok || raw > 0xFFFFFFFFULL) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] Invalid %1: %2")
+                    .arg(fieldName)
+                    .arg(trimmed));
+        return false;
+    }
+
+    outValue = static_cast<quint32>(raw);
+    return true;
+}
+
+bool Widget::readUserRegister(quint32 address, quint32 &value)
+{
+    // AXI lite 32bit 寄存器访问要求 4 字节对齐。
+    if ((address & 0x3u) != 0) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] Register address must be 4-byte aligned: %1")
+                    .arg(toHex32(address)));
+        return false;
+    }
+
+    HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+    if (!isValidHandle(user)) {
+        // 用户未手动点“打开XDMA通道并自检”时，提供自动兜底。
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[AXIL] user channel is not open, trying auto-open..."));
+        if (!openXdmaAndSelfCheck()) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[AXIL][ERROR] XDMA auto-open failed for register read."));
+            return false;
+        }
+        user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+    }
+
+    if (!isValidHandle(user)) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[AXIL][ERROR] user channel handle is invalid."));
+        return false;
+    }
+
+    unsigned int raw = 0;
+    // user 通道按地址偏移读 4 字节寄存器值。
+    const int ret = read_device(user,
+                                static_cast<long>(address),
+                                4,
+                                reinterpret_cast<BYTE *>(&raw));
+    if (ret != 4) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] read_device failed at %1, ret=%2")
+                    .arg(toHex32(address))
+                    .arg(ret));
+        return false;
+    }
+
+    value = static_cast<quint32>(raw);
+    return true;
+}
+
+bool Widget::writeUserRegister(quint32 address, quint32 value)
+{
+    // AXI lite 32bit 寄存器访问要求 4 字节对齐。
+    if ((address & 0x3u) != 0) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] Register address must be 4-byte aligned: %1")
+                    .arg(toHex32(address)));
+        return false;
+    }
+
+    HANDLE user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+    if (!isValidHandle(user)) {
+        // 用户未手动点“打开XDMA通道并自检”时，提供自动兜底。
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[AXIL] user channel is not open, trying auto-open..."));
+        if (!openXdmaAndSelfCheck()) {
+            ui->plainTextEdit->appendPlainText(
+                        QStringLiteral("[AXIL][ERROR] XDMA auto-open failed for register write."));
+            return false;
+        }
+        user = reinterpret_cast<HANDLE>(m_xdmaUserHandle);
+    }
+
+    if (!isValidHandle(user)) {
+        ui->plainTextEdit->appendPlainText(
+                    QStringLiteral("[AXIL][ERROR] user channel handle is invalid."));
+        return false;
+    }
+
+    unsigned int raw = static_cast<unsigned int>(value);
+    // user 通道按地址偏移写 4 字节寄存器值。
+    const int ret = write_device(user,
+                                 static_cast<long>(address),
+                                 4,
+                                 reinterpret_cast<BYTE *>(&raw));
+    if (ret != 4) {
+        ui->plainTextEdit->appendPlainText(
+                    QString("[AXIL][ERROR] write_device failed at %1, ret=%2")
+                    .arg(toHex32(address))
+                    .arg(ret));
+        return false;
+    }
+
     return true;
 }
 

@@ -1,6 +1,6 @@
 # camera_PC
 
-`camera_PC` 是一个基于 Qt 的摄像头采集与 XDMA 联调项目，核心目标是把视频数据在 PC 侧先标准化封包，再按固定批次稳定发送到 FPGA。
+`camera_PC` 是一个基于 Qt 的摄像头采集与 XDMA 联调项目，核心目标是把视频数据在 PC 侧先标准化封包，再按可配置批次稳定发送到 FPGA。
 
 ## 1. 项目思路
 
@@ -17,12 +17,13 @@
 - 尾包不足 `1006B` 时补零。
 
 3. 发送层（`widget.cpp` 中 XDMA 子模块）
-- 将协议包流累计为 `1MiB` 批次。
-- 每个 `1MiB` 批次只调用一次 XDMA 写入（单次 write）。
-- 不满 `1MiB` 的数据缓存等待下次补齐。
+- 将协议包流累计为“可配置批次”（默认 `1MiB`）。
+- 每个批次触发一次 XDMA 单次写入（single write）。
+- 不满一个批次的数据缓存等待后续补齐。
 
 4. UI 控制层（`widget.ui` + `widget.*`）
 - 按钮分组控制：采集/视频发送、XDMA/测试。
+- `写入大小(KB)` 控件可直接控制视频主链路每次写入 XDMA 的数据量。
 - 提供日志观察点，便于联调与定位。
 
 这个分层的直接收益是：
@@ -43,18 +44,19 @@
 - `payload`：每 `1006B` 原始视频数据生成 1 包。
 - 最后一包不足 `1006B` 也必须生成，剩余区域补 `0`。
 
-### 2.2 1MiB 聚合发送
+### 2.2 可配置批次聚合发送
 
-- `1024` 个协议包组成一个发送批次：`1024 * 1024B = 1MiB`。
-- 每个 `1MiB` 批次触发一次 XDMA 发送（单次写入）。
-- 未凑满 `1MiB` 的包数据保存在内部缓存，等后续视频数据补齐再发送。
+- 协议包按批次累计后发送，默认批次为 `1MiB`（`1024 * 1024B`）。
+- 每个批次只进行一次 XDMA 写入（single write）。
+- 未凑满一个批次的包数据保存在内部缓存，等后续视频数据补齐再发送。
+- 批次大小可通过 UI 的 `写入大小(KB)` 调整（代码要求按 `1024B` 包边界对齐）。
 
 ## 3. 核心功能
 
 1. 摄像头枚举与模式检查。
 2. 单帧抓拍（优先 YUY2/YUYV，含回退策略）。
-3. 单帧缓存发送：缓存帧 -> 封包 -> 1MiB 聚合 -> XDMA。
-4. 实时视频发送：预览帧 -> 封包 -> 1MiB 聚合 -> XDMA。
+3. 单帧缓存发送：缓存帧 -> 封包 -> 批次聚合 -> XDMA。
+4. 实时视频发送：预览帧 -> 封包 -> 批次聚合 -> XDMA。
 5. XDMA 通道打开与 ready_state 自检。
 6. XDMA 链路测试包发送（不依赖相机）。
 7. 协议封包模块手动自测（纯软件，不依赖 XDMA）。
@@ -67,9 +69,9 @@
   - 枚举相机与模式，快速检查驱动返回。
 - `采一帧`
   - 采集一帧并缓存；若是 YUYV 同时导出预览 PNG。
-- `发送缓存帧(封包+1MiB)`
-  - 将最近缓存帧走协议封包与 1MiB 聚合后发送。
-- `开始/停止实时视频发送(封包+1MiB)`
+- `发送缓存帧(封包+批量)`
+  - 将最近缓存帧走协议封包与批次聚合后发送。
+- `开始/停止实时视频发送(封包+批量)`
   - 开关实时发送，预览可继续显示。
 
 ### 4.2 XDMA 与测试
@@ -81,21 +83,30 @@
 - `运行协议封包自测`
   - 手动执行封包/聚合规则自测（软件侧）。
 
+### 4.3 运行时调参控件
+
+- `节流间隔(ms)`
+  - 控制实时视频发送最小间隔。
+- `写入大小(KB)`
+  - 控制视频主链路每次向 XDMA 写入的数据量（通过聚合批次大小实现）。
+
 ## 5. 调用链说明
 
 ### 5.1 缓存帧发送链路
 
-`采一帧` -> 缓存 `m_lastCapturedFramePayload` -> `sendVideoPayloadWithBatching()` -> `VideoPacketBatcher::enqueueVideoPayload()` -> 输出 `1MiB` 批次 -> `sendXdmaPayload(..., forceSingleWrite=true)`
+`采一帧` -> 缓存 `m_lastCapturedFramePayload` -> `sendVideoPayloadWithBatching()` -> `VideoPacketBatcher::enqueueVideoPayload()` -> 输出“当前配置大小”的批次 -> `sendXdmaPayload(..., forceSingleWrite=true)`
 
 ### 5.2 实时视频发送链路
 
-`QVideoProbe::videoFrameProbed` -> `onPreviewFrameProbed()` -> `sendVideoPayloadWithBatching()` -> `VideoPacketBatcher::enqueueVideoPayload()` -> 输出 `1MiB` 批次 -> `sendXdmaPayload(..., forceSingleWrite=true)`
+`QVideoProbe::videoFrameProbed` -> `onPreviewFrameProbed()` -> `sendVideoPayloadWithBatching()` -> `VideoPacketBatcher::enqueueVideoPayload()` -> 输出“当前配置大小”的批次 -> `sendXdmaPayload(..., forceSingleWrite=true)`
 
 ### 5.3 XDMA 测试链路
 
 `sendXdmaTestPacket()` -> `sendXdmaPayload(..., forceSingleWrite=false)`
 
-说明：视频主链路强制单次写入 1MiB；测试包与历史路径仍可走分块发送。
+说明：
+- 视频主链路按“当前写入大小”强制单次写入。
+- 测试包与历史兼容路径仍可走分块发送逻辑。
 
 ## 6. 使用方法
 
@@ -112,9 +123,10 @@
 2. 点击 `打开XDMA通道并自检`，确认通道打开成功。
 3. 点击 `发送XDMA链路测试包`，确认基础链路可写。
 4. 点击 `运行协议封包自测`，确认协议模块 PASS。
-5. 选择业务发送路径：
-- `采一帧` -> `发送缓存帧(封包+1MiB)`。
-- 或直接 `开始实时视频发送(封包+1MiB)`。
+5. 设置 `写入大小(KB)`（默认 1024 KB，可按联调需求调整）。
+6. 选择业务发送路径：
+- `采一帧` -> `发送缓存帧(封包+批量)`。
+- 或直接 `开始实时视频发送(封包+批量)`。
 
 ## 7. 手动自测说明
 
@@ -126,19 +138,21 @@
 - 包头是否为 `EB 90`。
 - `lengthH/lengthL` 是否等于实际 payload 长度。
 - 尾包不足 `1006B` 时是否正确补零。
-- 连续输入 1024 个协议包后是否刚好输出 1 个 `1MiB` 批次。
+- 默认配置下，连续输入 1024 个协议包后是否刚好输出 1 个 `1MiB` 批次。
 - 批次输出后缓存是否正确归零。
 
 ## 8. 日志速查
 
 - `[OK] XDMA open complete: user + h2c_0 ready.`
   - XDMA 会话已就绪。
-- `[PKG] ... raw=... packets=... emitted=... cached=...`
-  - 封包与聚合行为观察点。
+- `[CFG] XDMA write size set to ... KB`
+  - 视频主链路批次写入大小已更新。
+- `[PKG] ... raw=... packets=... emitted=... x ...KB, cached=...`
+  - 封包与聚合行为观察点（包含当前批次大小）。
 - `[SELFTEST] PASS ...`
   - 协议自测通过。
 - `[ERROR] XDMA single-write failed ...`
-  - 1MiB 批次发送失败。
+  - 当前批次的单次写入失败。
 
 ## 9. 代码结构
 
@@ -149,11 +163,12 @@
 - `cameraprobe.h / cameraprobe.cpp`
   - 相机模式枚举、单帧抓取、抓拍回调。
 - `video_packet_batcher.h / video_packet_batcher.cpp`
-  - 1024B 协议封包、1MiB 聚合、缓存与自测。
+  - 1024B 协议封包、可配置批次聚合、缓存与自测。
 - `driver/`
   - XDMA 动态库与导入库。
 
 ## 10. 备注
 
 - 目前 `dest/source/priority` 使用集中默认常量（见 `VideoPacketBatcher::defaultRouteFields()`）。
+- `写入大小(KB)` 的本质是修改视频主链路聚合批次大小，要求按 `1024B` 包边界对齐。
 - 后续如果需要切换路由字段，可扩展为 UI 配置或配置文件加载。
